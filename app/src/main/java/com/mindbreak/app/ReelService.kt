@@ -1,58 +1,88 @@
 package com.mindbreak.app
 
-import android.app.Activity
-import android.content.Intent
-import android.os.Bundle
-import android.provider.Settings
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
+import android.accessibilityservice.AccessibilityService
+import android.content.Context
+import android.os.SystemClock
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-class MainActivity : Activity() {
-    private lateinit var info: TextView
+object Store {
+    private fun p(c: Context) = c.getSharedPreferences("mb", Context.MODE_PRIVATE)
+    private fun day() = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        val pad = (20 * resources.displayMetrics.density).toInt()
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-        }
-        val btn = Button(this).apply {
-            text = "Accessibility ON karo"
-            setOnClickListener {
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-            }
-        }
-        info = TextView(this).apply { textSize = 18f; setPadding(0, pad, 0, 0) }
-        box.addView(btn)
-        box.addView(info)
-        setContentView(ScrollView(this).apply { addView(box) })
+    fun addReel(c: Context, app: String) {
+        val k = "${day()}_${app}_n"
+        p(c).edit().putInt(k, p(c).getInt(k, 0) + 1).apply()
     }
 
-    override fun onResume() {
-        super.onResume()
-        refresh()
+    fun addMs(c: Context, app: String, ms: Long) {
+        val k = "${day()}_${app}_ms"
+        p(c).edit().putLong(k, p(c).getLong(k, 0L) + ms).apply()
     }
 
-    private fun refresh() {
-        val igN = Store.reels(this, "instagram")
-        val ytN = Store.reels(this, "youtube")
-        val totalMs = Store.ms(this, "instagram") + Store.ms(this, "youtube")
-        val mins = totalMs / 60000.0
-        val penalty = (igN + ytN) * 0.15 + mins * 0.6
-        val score = (100 - penalty).toInt().coerceIn(0, 100)
-        val status = when {
-            score >= 70 -> "🟢 Healthy"
-            score >= 40 -> "🟡 Stress zone"
-            else -> "🔴 Overload"
+    fun reels(c: Context, app: String) = p(c).getInt("${day()}_${app}_n", 0)
+    fun ms(c: Context, app: String) = p(c).getLong("${day()}_${app}_ms", 0L)
+    fun setDebug(c: Context, s: String) = p(c).edit().putString("debug", s).apply()
+    fun debug(c: Context) = p(c).getString("debug", "") ?: ""
+}
+
+class ReelService : AccessibilityService() {
+    private var lastTick = 0L
+    private var lastCount = 0L
+
+    private val pkgs = mapOf(
+        "com.instagram.android" to "instagram",
+        "com.google.android.youtube" to "youtube"
+    )
+
+    // Ye IDs app update ke saath badal sakti hain
+    private val reelIds = mapOf(
+        "instagram" to listOf("com.instagram.android:id/clips_viewer_view_pager"),
+        "youtube" to listOf(
+            "com.google.android.youtube:id/reel_recycler",
+            "com.google.android.youtube:id/reel_player_page_container"
+        )
+    )
+
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+        val ev = e ?: return
+        val app = pkgs[ev.packageName?.toString()] ?: return
+        val root = rootInActiveWindow ?: return
+
+        val inReels = reelIds[app].orEmpty().any {
+            root.findAccessibilityNodeInfosByViewId(it).isNotEmpty()
         }
-        info.text = "Mind score: $score / 100\n$status\n\n" +
-            "Aaj ki reels: ${igN + ytN}\n" +
-            "Instagram: $igN\nYouTube Shorts: $ytN\n" +
-            "Reels time: ${"%.1f".format(mins)} min\n\n" +
-            "(Ye wellbeing estimate hai, medical salah nahi.)\n\n" +
-            "Debug: ${Store.debug(this)}"
+
+        if (!inReels) {
+            lastTick = 0L
+            if (ev.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) saveIds(app, root)
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        if (lastTick != 0L && now - lastTick < 5000) Store.addMs(this, app, now - lastTick)
+        lastTick = now
+
+        if (ev.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED && now - lastCount > 800) {
+            lastCount = now
+            Store.addReel(this, app)
+        }
     }
+
+    private fun saveIds(app: String, root: AccessibilityNodeInfo) {
+        val ids = linkedSetOf<String>()
+        collect(root, ids, 0)
+        Store.setDebug(this, app + ": " + ids.joinToString(", "))
+    }
+
+    private fun collect(n: AccessibilityNodeInfo?, out: MutableSet<String>, depth: Int) {
+        if (n == null || depth > 12 || out.size > 40) return
+        n.viewIdResourceName?.let { out.add(it.substringAfter(":id/")) }
+        for (i in 0 until n.childCount) collect(n.getChild(i), out, depth + 1)
+    }
+
+    override fun onInterrupt() {}
 }
